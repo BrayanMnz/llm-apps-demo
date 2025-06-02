@@ -13,7 +13,7 @@
     <properties>
         <java.version>24</java.version>
 <!--        <vaadin.version>24.7.6</vaadin.version>-->
-        <vaadin.version>24.8.0.alpha5</vaadin.version>
+        <vaadin.version>24.8.0.beta2</vaadin.version>
 
         <spring-ai.version>1.0.0</spring-ai.version>
     </properties>
