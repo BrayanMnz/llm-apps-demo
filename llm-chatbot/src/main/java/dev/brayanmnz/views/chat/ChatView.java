@@ -1,14 +1,12 @@
 package dev.brayanmnz.views.chat;
 
-import com.vaadin.collaborationengine.CollaborationMessageInput;
-import com.vaadin.collaborationengine.CollaborationMessageList;
-import com.vaadin.collaborationengine.MessageManager;
-import com.vaadin.collaborationengine.UserInfo;
 import com.vaadin.flow.component.AttachEvent;
 import com.vaadin.flow.component.UI;
-import com.vaadin.flow.component.html.Div;
 import com.vaadin.flow.component.html.Span;
+import com.vaadin.flow.component.messages.MessageInput;
 import com.vaadin.flow.component.messages.MessageInputI18n;
+import com.vaadin.flow.component.messages.MessageList;
+import com.vaadin.flow.component.messages.MessageListItem;
 import com.vaadin.flow.component.orderedlayout.HorizontalLayout;
 import com.vaadin.flow.component.orderedlayout.VerticalLayout;
 import com.vaadin.flow.component.page.Page;
@@ -24,12 +22,20 @@ import com.vaadin.flow.theme.lumo.LumoUtility.Flex;
 import com.vaadin.flow.theme.lumo.LumoUtility.JustifyContent;
 import com.vaadin.flow.theme.lumo.LumoUtility.Overflow;
 import com.vaadin.flow.theme.lumo.LumoUtility.Width;
-
+import com.vaadin.collaborationengine.UserInfo;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
+import dev.brayanmnz.service.ChatAssistantService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.messages.AssistantMessage;
+import org.springframework.ai.chat.messages.Message;
+import org.springframework.ai.chat.messages.UserMessage;
 import org.vaadin.lineawesome.LineAwesomeIconUrl;
 
 @PageTitle("Asistente Financiero Inteligente 🤖 🇩🇴")
@@ -38,11 +44,20 @@ import org.vaadin.lineawesome.LineAwesomeIconUrl;
 public class ChatView extends HorizontalLayout {
 
     transient Logger logger = LoggerFactory.getLogger(ChatView.class);
-    transient ChatClient.Builder builder;
-    private CollaborationMessageInput input;
-    private final CollaborationMessageList messageList;
+
+    private MessageInput input;
+    private MessageList messageList;
     private VerticalLayout chatContainer;
 
+    private UserInfo humanUserInfo;
+    private static final UserInfo AI_USER_INFO = new UserInfo(
+            "ai-assistant-" + UUID.randomUUID().toString(), // Unique ID for AI
+            "AI Assistant 🤖",
+            "https://png.pngtree.com/png-clipart/20210311/original/pngtree-cute-robot-mascot-logo-png-image_6023574.jpg"
+    );
+
+    private transient Map<String, List<MessageListItem>> chatHistories;
+    private final ChatAssistantService chatAssistantService;
 
     public static class ChatTab extends Tab {
         private final transient ChatInfo chatInfo;
@@ -66,19 +81,20 @@ public class ChatView extends HorizontalLayout {
             this.unread = unread;
         }
 
+        public String getName() {
+            return name;
+        }
+
         public void resetUnread() {
             unread = 0;
             updateBadge();
         }
 
-        public void incrementUnread() {
-            unread++;
-            updateBadge();
-        }
-
         private void updateBadge() {
-            unreadBadge.setText(unread + "");
-            unreadBadge.setVisible(unread != 0);
+            if (unreadBadge != null) {
+                unreadBadge.setText(unread > 0 ? String.valueOf(unread) : "");
+                unreadBadge.setVisible(unread != 0);
+            }
         }
 
         public void setUnreadBadge(Span unreadBadge) {
@@ -86,205 +102,160 @@ public class ChatView extends HorizontalLayout {
             updateBadge();
         }
 
-        public String getCollaborationTopic() {
-            return "chat/" + name;
-        }
     }
 
     private transient ChatInfo[] chats = new ChatInfo[]{new ChatInfo("general", 0)};
     private transient ChatInfo currentChat = chats[0];
     private Tabs tabs;
 
-    public ChatView(ChatClient.Builder builder) {
-        this.builder = builder;
+    public ChatView(ChatAssistantService chatAssistantService) {
+        this.chatAssistantService = chatAssistantService;
         addClassNames("chat-view", Width.FULL, Display.FLEX, Flex.AUTO);
         setSpacing(false);
 
-        // UserInfo is used by Collaboration Engine and is used to share details
-        // of users to each other to able collaboration. Replace this with
-        // information about the actual user that is logged, providing a user
-        // identifier, and the user's real name. You can also provide the users
-        // avatar by passing an url to the image as a third parameter, or by
-        // configuring an `ImageProvider` to `avatarGroup`.
-        UserInfo userInfo = new UserInfo(UUID.randomUUID().toString(), "Brayan Muñoz");
+        humanUserInfo = new UserInfo(UUID.randomUUID().toString(), "Brayan Muñoz");
 
         tabs = new Tabs();
+        chatHistories = new HashMap<>();
+
         for (ChatInfo chat : chats) {
-            // Listen for new messages in each chat so we can update the
-            // "unread" count
-            MessageManager mm = new MessageManager(this, userInfo, chat.getCollaborationTopic());
-            mm.setMessageHandler(context -> {
-                if (currentChat != chat) {
-                    chat.incrementUnread();
-                }
-
-                if (context.getMessage().getUser().getId().equals(userInfo.getId()) && currentChat == chat) {
-                    String userMessageText = context.getMessage().getText();
-                    respondAsAiAssistant(userMessageText, chat.getCollaborationTopic());
-                }
-
-            });
-
+            chatHistories.put(chat.getName(), new ArrayList<>());
             tabs.add(createTab(chat));
         }
         tabs.setOrientation(Orientation.VERTICAL);
-        tabs.addClassNames(Flex.GROW, Flex.SHRINK, Overflow.HIDDEN);
+        tabs.addClassNames(Flex.GROW_NONE, Flex.SHRINK_NONE, Overflow.HIDDEN, LumoUtility.Width.XSMALL);
 
-        // CollaborationMessageList displays messages that are in a
-        // Collaboration Engine topic. You should give in the user details of
-        // the current user using the component, and a topic Id. Topic id can be
-        // any freeform string. In this template, we have used the format
-        // "chat/#general".
-        messageList = new CollaborationMessageList(userInfo, currentChat.getCollaborationTopic());
+        messageList = new MessageList();
+        messageList.setMarkdown(true);
         messageList.setSizeFull();
 
-        // `CollaborationMessageInput is a textfield and button, to be able to
-        // submit new messages. To avoid having to set the same info into both
-        // the message list and message input, the input takes in the list as an
-        // constructor argument to get the information from there.
-        this.input = new CollaborationMessageInput(messageList);
+        input = new MessageInput();
         input.setTooltipText("Escribe tu consulta financiera");
         input.setI18n(new MessageInputI18n().setMessage("Mensaje").setSend("Consulta"));
         input.setWidthFull();
 
-        // Layouting
-        this.chatContainer = new VerticalLayout();
-        // Use Overflow.AUTO to allow chatContainer to scroll
-        this.chatContainer.addClassNames(Flex.AUTO, LumoUtility.Overflow.AUTO, LumoUtility.Padding.NONE);
-        this.chatContainer.setSpacing(false);
+        input.addSubmitListener(event -> {
+            String userMessageText = event.getValue();
+            if (userMessageText == null || userMessageText.isBlank()) {
+                return;
+            }
 
+            MessageListItem userItem = createMessageListItem(userMessageText, humanUserInfo, false);
+            logger.info("Created user message item: '{}'", userItem.getText());
 
-        this.chatContainer.add(messageList, this.input);
-        expand(messageList);
-        add(chatContainer);
+            final UI currentUI = UI.getCurrent();
+            if (currentUI == null || !currentUI.isAttached()) {
+                logger.error("UI not available or attached when submitting user message.");
+                return;
+            }
+
+            currentUI.access(() -> {
+                if (messageList != null && messageList.isAttached()) {
+                    List<MessageListItem> currentDisplayItems = new ArrayList<>(messageList.getItems());
+                    currentDisplayItems.add(userItem);
+                    messageList.setItems(currentDisplayItems);
+
+                    logger.info("User message added to messageList. Total items now: {}. Last item: '{}'",
+                            messageList.getItems().size(),
+                            messageList.getItems().isEmpty() ? "N/A" : messageList.getItems().getLast().getText());
+
+                    if (currentChat != null && currentChat.getName() != null && chatHistories != null) {
+                        chatHistories.computeIfAbsent(currentChat.getName(), k -> new ArrayList<>()).add(userItem);
+                        logger.info("User item added to history for chat: {}. History size for this chat: {}",
+                                currentChat.getName(),
+                                chatHistories.get(currentChat.getName()).size());
+                    } else {
+                        logger.warn("Could not add user item to history. currentChat, its name, or chatHistories might be null/problematic.");
+                    }
+
+                    scrollToBottomChatContainer(currentUI);
+                } else {
+                    logger.error("MessageList is null or not attached when trying to add user message.");
+                }
+            });
+
+            respondAsAiAssistant(userMessageText, currentChat.getName());
+        });
+
+        chatContainer = new VerticalLayout();
+        chatContainer.addClassNames(Flex.AUTO, LumoUtility.Overflow.AUTO, LumoUtility.Padding.NONE);
+        chatContainer.setSpacing(false);
+        chatContainer.setHeightFull();
+
+        chatContainer.add(messageList, input);
+        chatContainer.expand(messageList);
+
+        add(tabs, chatContainer);
+        expand(chatContainer);
         setSizeFull();
 
+        messageList.setItems(chatHistories.get(currentChat.getName()));
 
-        // Change the topic id of the chat when a new tab is selected
         tabs.addSelectedChangeListener(event -> {
             currentChat = ((ChatTab) event.getSelectedTab()).getChatInfo();
             currentChat.resetUnread();
-            messageList.setTopic(currentChat.getCollaborationTopic());
+            messageList.setItems(chatHistories.getOrDefault(currentChat.getName(), new ArrayList<>()));
+            scrollToBottomChatContainer(UI.getCurrent());
         });
     }
 
-    /**
-     * Generates a response as the AI Assistant based on the user's message and submits it.
-     *
-     * @param originalUserMessage The message text from the human user.
-     * @param topicId             The collaboration topic ID where the AI should respond.
-     */
-    private void respondAsAiAssistant(String originalUserMessage, String topicId) {
-        UserInfo AI_USER_INFO = new UserInfo(UUID.randomUUID().toString(), "AI Assistant 🤖", "https://png.pngtree.com/png-clipart/20210311/original/pngtree-cute-robot-mascot-logo-png-image_6023574.jpg");
+    private List<Message> convertToSpringAIMessages(List<MessageListItem> fullUiHistoryIncludingLatestUser) {
+        List<Message> aiMessages = new ArrayList<>();
+        for (MessageListItem uiItem : fullUiHistoryIncludingLatestUser) {
+            String messageText = uiItem.getText();
+            if (uiItem.getUserColorIndex() == 1) {
+                aiMessages.add(new UserMessage(messageText));
+            } else if (uiItem.getUserColorIndex() == 2 && (!"...".equals(messageText) && !messageText.isBlank())) {
+                aiMessages.add(new AssistantMessage(messageText));
+            }
+        }
+        return aiMessages;
+    }
 
+    private MessageListItem createMessageListItem(String text, UserInfo user, boolean isAssistant) {
+        MessageListItem item = new MessageListItem(text, Instant.now(), user.getName());
+        if (user.getImage() != null && !user.getImage().isEmpty()) {
+            item.setUserImage(user.getImage());
+        } else {
+            String name = user.getName();
+            if (name != null && !name.isEmpty()) {
+                String[] parts = name.split("\\s+");
+                if (parts.length > 1 && !parts[0].isEmpty() && !parts[1].isEmpty()) {
+                    item.setUserAbbreviation(String.valueOf(parts[0].charAt(0)) + parts[1].charAt(0));
+                } else {
+                    item.setUserAbbreviation(String.valueOf(name.charAt(0)));
+                }
+            } else {
+                item.setUserAbbreviation("?");
+            }
+        }
+        item.setUserColorIndex(isAssistant ? 2 : 1);
+        return item;
+    }
+
+
+    private void respondAsAiAssistant(String originalUserMessageText, String chatName) {
         final UI currentUI = UI.getCurrent();
         if (currentUI == null) {
-            logger.error("Cannot respond as AI: UI is not available.");
+            logger.error("Cannot respond as AI: UI is not available for chat '{}'", chatName);
             return;
         }
 
-        // Temporary Div for streaming content
-        Div aiStreamingMessageWrapper = new Div();
-        // Style like a message item: avatar + content bubble
-        aiStreamingMessageWrapper.addClassNames(
-                LumoUtility.Display.FLEX, LumoUtility.Gap.SMALL, LumoUtility.Padding.Horizontal.SMALL, LumoUtility.Padding.Vertical.XSMALL
-        );
+        MessageListItem aiMessageItem = createMessageListItem("...", AI_USER_INFO, true);
+        addMessageToUI(currentUI, aiMessageItem);
 
-        int inputComponentIndex = chatContainer.indexOf(this.input);
-        if (inputComponentIndex != -1) {
-            chatContainer.addComponentAtIndex(inputComponentIndex, aiStreamingMessageWrapper);
-        } else {
-            chatContainer.add(aiStreamingMessageWrapper);
-            logger.warn("Could not find input component in chatContainer to insert streaming message above it. Appending to end.");
-        }
+        List<MessageListItem> currentChatUIHistory = chatHistories.getOrDefault(chatName, new ArrayList<>());
+        List<Message> conversationHistoryForAI = convertToSpringAIMessages(new ArrayList<>(currentChatUIHistory));
 
-        scrollToBottomChatContainer(currentUI); // Scroll after user message is likely rendered
-
-        Span avatarSpan = new Span("AI");
-        avatarSpan.addClassNames(
-                LumoUtility.FontSize.SMALL, LumoUtility.TextColor.PRIMARY,
-                LumoUtility.Background.CONTRAST_10, LumoUtility.BorderRadius.LARGE,
-                LumoUtility.Width.MEDIUM, LumoUtility.Height.MEDIUM,
-                LumoUtility.Display.FLEX, LumoUtility.AlignItems.CENTER, LumoUtility.JustifyContent.CENTER,
-                LumoUtility.Flex.SHRINK_NONE
-        );
-
-        Div messageBubble = new Div();
-        messageBubble.addClassNames(
-                LumoUtility.Background.CONTRAST_5, LumoUtility.BorderRadius.MEDIUM,
-                LumoUtility.Padding.SMALL, "ai-streaming-bubble" // Custom class for further styling if needed
-        );
-        Span messageTextSpan = new Span("..."); // Initial placeholder text
-        messageBubble.add(messageTextSpan);
-        aiStreamingMessageWrapper.add(avatarSpan, messageBubble);
+        logger.info("Sending {} messages to AI as context for chat '{}'.",
+                conversationHistoryForAI.size(), chatName);
 
         StringBuilder fullResponse = new StringBuilder();
-        ChatClient chatClient = builder.build();
 
-        chatClient.prompt()
-                .user(originalUserMessage)
-                .stream()
-                .content() // Returns Flux<String>
-                // .publishOn(Schedulers.boundedElastic()) // Optional: ensure non-UI thread for subscription if Spring AI doesn't guarantee
-                .doOnNext(chunk -> {
-                    if (currentUI.isAttached()) {
-                        currentUI.access(() -> {
-                            // Check attachment again inside access, as UI/component might detach
-                            if (currentUI.isAttached() && aiStreamingMessageWrapper.isAttached()) {
-                                if (fullResponse.isEmpty() && chunk.isBlank()) {
-                                    // Skip leading blank chunks if message is empty
-                                    return;
-                                }
-                                fullResponse.append(chunk);
-                                messageTextSpan.setText(fullResponse.toString());
-                                scrollToBottomChatContainer(currentUI);
-                            }
-                        });
-                    }
-                })
-                .doOnComplete(() -> {
-                    if (currentUI.isAttached()) {
-                        currentUI.access(() -> {
-                            if (currentUI.isAttached()) {
-                                if (aiStreamingMessageWrapper.isAttached()) {
-                                    chatContainer.remove(aiStreamingMessageWrapper);
-                                }
-                                if (!fullResponse.toString().isBlank()) {
-                                    MessageManager aiMessageManager = new MessageManager(this, AI_USER_INFO, topicId);
-                                    aiMessageManager.submit(fullResponse.toString().trim());
-                                    logger.info("AI Assistant (streamed) submitted to topic '{}'", topicId);
-                                } else {
-                                    logger.info("AI Assistant (streamed) produced empty response for topic '{}'", topicId);
-                                }
-                                scrollToBottomChatContainer(currentUI); // Scroll after final message is added
-                            } else {
-                                handleUIDetached("stream completion", null);
-                            }
-                        });
-                    } else {
-                        handleUINotAvailable("stream completion", null);
-                    }
-                })
-                .doOnError(error -> {
-                    logger.error("Error streaming AI response for topic '{}': {}", topicId, error.getMessage(), error);
-                    if (currentUI.isAttached()) {
-                        currentUI.access(() -> {
-                            if (currentUI.isAttached()) {
-                                if (aiStreamingMessageWrapper.isAttached()) {
-                                    chatContainer.remove(aiStreamingMessageWrapper);
-                                }
-                                UserInfo systemInfo = new UserInfo("system-error-" + UUID.randomUUID(), "System Error");
-                                MessageManager errorManager = new MessageManager(this, systemInfo, topicId);
-                                errorManager.submit("Lo siento, ocurrió un error al intentar responder: " + error.getMessage());
-                                scrollToBottomChatContainer(currentUI);
-                            } else {
-                                handleUIDetached("stream error", error);
-                            }
-                        });
-                    } else {
-                        handleUINotAvailable("stream error", error);
-                    }
-                })
+        chatAssistantService.streamChatResponse(originalUserMessageText, conversationHistoryForAI)
+                .doOnNext(chunk -> handleStreamingChunk(currentUI, aiMessageItem, fullResponse, chunk))
+                .doOnComplete(() -> handleStreamCompletion(currentUI, aiMessageItem, fullResponse, chatName))
+                .doOnError(error -> handleStreamError(currentUI, aiMessageItem, chatName, error))
                 .subscribe(
                         content -> { /* Handled in doOnNext */ },
                         error -> { /* Handled in doOnError */ },
@@ -292,15 +263,108 @@ public class ChatView extends HorizontalLayout {
                 );
     }
 
+    private void addMessageToUI(UI currentUI, MessageListItem item) {
+        currentUI.access(() -> {
+            if (messageList.isAttached()) {
+                List<MessageListItem> currentDisplayItems = new ArrayList<>(messageList.getItems());
+                currentDisplayItems.add(item);
+                messageList.setItems(currentDisplayItems);
+                scrollToBottomChatContainer(currentUI);
+            } else {
+                logger.warn("MessageList not attached when trying to add item: {}", item.getText());
+            }
+        });
+    }
+
+    private void handleStreamingChunk(UI currentUI, MessageListItem aiMessageItem, StringBuilder fullResponse, String chunk) {
+        if (currentUI.isAttached()) {
+            currentUI.access(() -> {
+                if (messageList.isAttached() && aiMessageItem != null) {
+                    if (fullResponse.isEmpty() && chunk.isBlank() && aiMessageItem.getText().equals("...")) {
+                        return; // Skip leading blank chunks if placeholder is still "..."
+                    }
+                    // Always set the full text as MessageListItem doesn't have appendText
+                    if (aiMessageItem.getText().equals("...")) { // First actual chunk
+                        fullResponse.append(chunk);
+                        aiMessageItem.setText(fullResponse.toString());
+                    } else { // Subsequent chunks
+                        fullResponse.append(chunk);
+                        aiMessageItem.setText(fullResponse.toString());
+                    }
+                    scrollToBottomChatContainer(currentUI);
+                }
+            });
+        }
+    }
+
+    private void handleStreamCompletion(UI currentUI, MessageListItem aiMessageItem, StringBuilder fullResponse, String chatName) {
+        if (currentUI.isAttached()) {
+            currentUI.access(() -> {
+                if (messageList.isAttached() && aiMessageItem != null) {
+                    String finalResponseText = fullResponse.toString().trim();
+                    if (finalResponseText.isBlank() && aiMessageItem.getText().equals("...")) {
+                        aiMessageItem.setText("(AI no generó respuesta)");
+                        logger.info("AI Assistant (streamed) produced empty response for chat '{}'", chatName);
+                    } else if (!finalResponseText.isBlank()) {
+                        aiMessageItem.setText(finalResponseText);
+                    }
+
+                    List<MessageListItem> historyList = chatHistories.computeIfAbsent(chatName, k -> new ArrayList<>());
+                    if (!historyList.contains(aiMessageItem)) {
+                        // This ensures the updated aiMessageItem (by reference) is in history
+                        historyList.add(aiMessageItem);
+                    }
+                    logger.info("AI Assistant (streamed) response completed for chat '{}'. History size: {}", chatName, historyList.size());
+                    scrollToBottomChatContainer(currentUI);
+                } else {
+                    handleUIDetached("stream completion for " + chatName, null);
+                }
+            });
+        } else {
+            handleUINotAvailable("stream completion for " + chatName, null);
+        }
+    }
+
+    private void handleStreamError(UI currentUI, MessageListItem aiMessageItem, String chatName, Throwable error) {
+        logger.error("Error streaming AI response for chat '{}': {}", chatName, error.getMessage(), error);
+        if (currentUI.isAttached()) {
+            currentUI.access(() -> {
+                if (messageList.isAttached()) {
+                    List<MessageListItem> currentDisplayItems = new ArrayList<>(messageList.getItems());
+                    if (aiMessageItem != null && currentDisplayItems.contains(aiMessageItem)) {
+                        currentDisplayItems.remove(aiMessageItem);
+                        chatHistories.getOrDefault(chatName, new ArrayList<>()).remove(aiMessageItem);
+                    }
+
+                    MessageListItem errorItem = createMessageListItem(
+                            "Lo siento, ocurrió un error al intentar responder: " + error.getMessage(),
+                            new UserInfo("system-error", "System Error"), true);
+                    errorItem.setUserColorIndex(3);
+
+                    currentDisplayItems.add(errorItem);
+                    messageList.setItems(currentDisplayItems);
+
+                    chatHistories.computeIfAbsent(chatName, k -> new ArrayList<>()).add(errorItem);
+                    scrollToBottomChatContainer(currentUI);
+                } else {
+                    handleUIDetached("stream error for " + chatName, error);
+                }
+            });
+        } else {
+            handleUINotAvailable("stream error for " + chatName, error);
+        }
+    }
+
     private ChatTab createTab(ChatInfo chat) {
         ChatTab tab = new ChatTab(chat);
-        tab.addClassNames(JustifyContent.BETWEEN);
+        tab.addClassNames(JustifyContent.BETWEEN, LumoUtility.Padding.SMALL);
 
         Span badge = new Span();
         chat.setUnreadBadge(badge);
         badge.getElement().getThemeList().add("badge small contrast");
-        tab.add(new Span("#" + chat.name), badge);
+        badge.getStyle().set("margin-inline-start", "0.5em");
 
+        tab.add(badge);
         return tab;
     }
 
@@ -308,31 +372,36 @@ public class ChatView extends HorizontalLayout {
     protected void onAttach(AttachEvent attachEvent) {
         super.onAttach(attachEvent);
         Page page = attachEvent.getUI().getPage();
-        page.retrieveExtendedClientDetails(details -> setMobile(details.getWindowInnerWidth() < 740));
+        page.retrieveExtendedClientDetails(details -> {
+            if (details != null) setMobile(details.getWindowInnerWidth() < 740);
+        });
         page.addBrowserWindowResizeListener(e -> setMobile(e.getWidth() < 740));
     }
 
     private void setMobile(boolean mobile) {
         tabs.setOrientation(mobile ? Orientation.HORIZONTAL : Orientation.VERTICAL);
+        if (mobile) {
+            tabs.removeClassName(LumoUtility.Width.XSMALL);
+            tabs.addClassName(LumoUtility.Width.FULL);
+        } else {
+            tabs.removeClassName(LumoUtility.Width.FULL);
+            tabs.addClassName(LumoUtility.Width.XSMALL);
+        }
     }
 
-    // Helper method for scrolling the main chat container
     private void scrollToBottomChatContainer(UI ui) {
         if (ui != null && ui.isAttached() && chatContainer != null && chatContainer.isAttached()) {
-            ui.access(() -> { // Ensure UI access
-                if (chatContainer.isAttached()) { // Double check inside access
+            ui.access(() -> {
+                if (chatContainer.isAttached()) {
                     chatContainer.getElement().executeJs("this.scrollTop = this.scrollHeight");
                 }
             });
         }
     }
 
-    // Helper methods for logging UI detachment/unavailability and cleaning up
     private void cleanupLingeringUI(String logContext, Throwable error) {
         String errorMessage = error != null ? error.getMessage() : "N/A";
-        logger.warn("UI state issue during {}. Error: {}. Attempting cleanup.", logContext, errorMessage);
-        // If aiStreamingMessageWrapper were a field and could be accessed here,
-        // you might try to remove it too, but it's local to respondAsAiAssistant.
+        logger.warn("UI state issue during {}. Error: {}. No specific UI elements to clean in this version.", logContext, errorMessage);
     }
 
     private void handleUIDetached(String context, Throwable error) {
@@ -342,5 +411,4 @@ public class ChatView extends HorizontalLayout {
     private void handleUINotAvailable(String context, Throwable error) {
         cleanupLingeringUI("UI not available for " + context, error);
     }
-
 }
